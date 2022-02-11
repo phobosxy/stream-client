@@ -134,7 +134,7 @@ struct reconnection_strategy_greedy {
             } catch (const boost::system::system_error& e) {
                 auto log = log_func();
                 if (log) {
-                    log("failed to establish new session", e);
+                    log("greedy: failed to establish new session", e);
                 }
             }
         };
@@ -151,12 +151,27 @@ struct reconnection_strategy_greedy {
     }
 };
 
-/*
+static const boost::system::system_error noerr_sys = boost::system::system_error(make_error_code(boost::system::errc::success));
 template <typename Connector>
 struct reconnection_strategy_conservative {
+    typedef std::chrono::steady_clock clk;
+
+    reconnection_strategy_conservative()
+        : r_generator(r_device_())
+    {
+    }
+
     template<typename append_session_func_type>
     bool proceed(Connector& connector, std::size_t vacant_places, append_session_func_type append_func)
     {
+        auto log = log_func();
+        if (clk::now() < wait_until_) {
+            log("conservative: waiting on backoff", noerr_sys);
+            return false;
+        }
+
+        std::atomic_bool is_added{false};
+
         // creating new sessions may be slow and we want to add them simultaneously;
         // that's why we need to sync adding threads and lock pool
         auto add_session = [&]() {
@@ -164,26 +179,59 @@ struct reconnection_strategy_conservative {
                 // getting new session is time consuming operation
                 auto new_session = connector.new_session();
                 append_func(std::move(new_session));
+                is_added = true;
             } catch (const boost::system::system_error& e) {
-                auto log = log_func();
                 if (log) {
-                    log("failed to establish new session", e);
+                    log("conservative: failed to establish new session", e);
                 }
             }
         };
 
-        std::list<std::thread> adders;
-        for (std::size_t i = 0; i < vacant_places; ++i) {
-            adders.emplace_back(add_session);
+        log("conservative: vacant: " + std::to_string(vacant_places), noerr_sys);
+        std::vector<std::thread> adders;
+        const size_t parallel = (vacant_places + 2) / 3 - 1;
+        if (!backoff_us_ && parallel > 0) {
+            if (log) {
+                log("conservative: use parallel: " + std::to_string(parallel), noerr_sys);
+            }
+            adders.reserve(parallel);
+            for (std::size_t i = 0; i < parallel; ++i) {
+                adders.emplace_back(add_session);
+            }
         }
+        add_session();
         for (auto& a : adders) {
             a.join();
         }
 
-        return vacant_places > 0;
+        if (is_added) {
+            log("conservative: was added, no backoff", noerr_sys);
+            backoff_us_ = 0;
+            return true;
+        }
+
+        if (!backoff_us_) {
+            backoff_us_ = 50;
+            log("conservative: new backoff: " + std::to_string(backoff_us_), noerr_sys);
+        } else {
+            backoff_us_ *= 3;
+            log("conservative: enlarge backoff: " + std::to_string(backoff_us_), noerr_sys);
+        }
+        const auto rand_val = double(r_generator()) / r_generator.max();
+        log("conservative: random val: " + std::to_string(rand_val), noerr_sys);
+        backoff_us_ *= rand_val;
+        log("conservative: random backoff: " + std::to_string(backoff_us_), noerr_sys);
+        wait_until_ = clk::now() + std::chrono::milliseconds(std::min(max_us_, backoff_us_));
+
+        return false;
     }
+
+    static constexpr unsigned long max_us_ = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::seconds(10)).count();
+    clk::time_point wait_until_ = {};
+    unsigned long backoff_us_ = 0;
+    std::random_device r_device_;
+    std::mt19937 r_generator;
 };
-*/
 
 template <typename Connector, typename ReconnectionStrategy>
 void base_connection_pool<Connector, ReconnectionStrategy>::watch_pool_routine()
@@ -215,11 +263,13 @@ void base_connection_pool<Connector, ReconnectionStrategy>::watch_pool_routine()
         // pool_current_size may be bigger if someone returned previous session
         std::size_t vacant_places = (pool_max_size_ > pool_current_size) ? pool_max_size_ - pool_current_size : 0;
 
-        auto need_more = reconnection_.proceed(connector_, vacant_places, [this](std::unique_ptr<stream_type>&& session) {
-            this->append_session(std::move(session));
-        });
-        if (need_more) {
-            continue;
+        if (vacant_places) {
+            const auto need_more = reconnection_.proceed(connector_, vacant_places, [this](std::unique_ptr<stream_type>&& session) {
+                this->append_session(std::move(session));
+            });
+            if (need_more) {
+                continue;
+            }
         }
 
         // stop cpu spooling if nothing has been added

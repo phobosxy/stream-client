@@ -35,7 +35,7 @@ struct reconnection_strategy_conservative;
  *
  * @tparam Connector Type of connector to use to create sockets.
  */
-template <typename Connector, typename ReconnectionStrategy = reconnection_strategy_greedy<Connector> >
+template <typename Connector, typename ReconnectionStrategy = reconnection_strategy_conservative<Connector> >
 class base_connection_pool
 {
 public:

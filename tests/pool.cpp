@@ -16,6 +16,15 @@ TYPED_TEST(PoolServerEnv, PoolConnect)
         future_sessions.emplace_back(this->server.get_session());
     }
 
+    auto log_func = [](const std::string& message, boost::system::system_error e) {
+        auto ec = e.code();
+        std::stringstream ss;
+        const auto now = std::chrono::system_clock::now();
+        const std::time_t t_c = std::chrono::system_clock::to_time_t(now);
+        ss << std::put_time(std::localtime(&t_c), "%Y-%m-%dT%H:%M:%SZ") << ": " << message << ": " << ec.message() << std::endl;
+        std::cout << ss.str();
+    };
+    stream_client::connector::log_func(log_func);
     std::unique_ptr<client_pool_type> clients_pool;
     ASSERT_NO_THROW({
         clients_pool = std::make_unique<client_pool_type>(pool_size, this->host, std::to_string(this->port),
